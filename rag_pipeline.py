@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -13,15 +14,41 @@ load_dotenv()
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
 
-def fetch_transcript(video_id):
+def extract_video_id(url):
     """
-    Fetches transcript for the given YouTube video ID.
-    If the transcript is unavailable (e.g., no captions), returns None.
+    Extracts the video ID from a given YouTube URL.
+    Supports standard, shortened, and embed URLs.
     """
+    parsed_url = urlparse(url)
+
+    # Case 1: Standard YouTube link with ?v=VIDEO_ID
+    if parsed_url.query:
+        query_params = parse_qs(parsed_url.query)
+        if 'v' in query_params:
+            return query_params['v'][0]
+
+    # Case 2: Shortened youtu.be link
+    if parsed_url.netloc in ['youtu.be', 'www.youtu.be']:
+        return parsed_url.path.lstrip('/')
+
+    # Case 3: Embed or other path-based YouTube link
+    if 'embed' in parsed_url.path:
+        return parsed_url.path.split('/')[-1]
+
+    return None
+
+
+def fetch_transcript(video_url):
+    """
+    Fetches transcript for the given YouTube video URL.
+    If the transcript is unavailable, returns None.
+    """
+    video_id = extract_video_id(video_url)
+    if not video_id:
+        raise ValueError("Invalid YouTube URL. Could not extract video ID.")
+
     try:
-        # Fetch the transcript in English or German if available
         en_transcript = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'de'])
-        # Join all caption snippets into one text string
         transcript_text = " ".join(snippet.text for snippet in en_transcript)
         return transcript_text
     except TranscriptsDisabled:
@@ -49,18 +76,15 @@ def get_answer(vector_store, query):
     Retrieves the most relevant transcript chunks using FAISS retriever
     and answers the user's query using Gemini LLM.
     """
-    # Retrieve top 4 most similar transcript chunks
     retrieval = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     retrieved_docs = retrieval.invoke(query)
 
-    # Initialize Google Gemini LLM
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash",
         temperature=0.3,
         google_api_key=os.environ["GOOGLE_API_KEY"]
     )
 
-    # Prompt template ensures answers are based on the transcript only
     prompt = PromptTemplate(
         template="""
         You are a helpful assistant.
@@ -72,7 +96,6 @@ def get_answer(vector_store, query):
         input_variables=["context", "question"]
     )
 
-    # Merge retrieved docs into one context string
     context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
     final_prompt = prompt.format(context=context_text, question=query)
     answer = llm.invoke(final_prompt)
